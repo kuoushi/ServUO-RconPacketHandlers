@@ -1,4 +1,4 @@
-﻿/***************************************************************************
+/***************************************************************************
  *                     CustomRemoteAdminPacketHandlers.cs
  *                            -------------------
  *   begin                : Jan 24, 2022
@@ -57,7 +57,7 @@ namespace Server.RemoteAdmin
 			Seek(0, System.IO.SeekOrigin.Begin);
 			var head = ReadInt32();
 			m_CommandByte = ReadByte();
-			if (head != -1 || end != 10 || !m_Commands.ContainsKey(m_CommandByte)) { m_Valid = false; }
+			if (head != -1 || end != 0x0A || !m_Commands.ContainsKey(m_CommandByte)) { m_Valid = false; }
 			else { m_Valid = true; }
 		}
 
@@ -309,10 +309,10 @@ namespace Server.RemoteAdmin
 			}
 
 			string message = pvSrc.ReadUTF8String();
-			int hue = pvSrc.ReadInt16();
-			bool ascii = pvSrc.ReadBoolean();
+			int hue = pvSrc.ReadInt32();
+			// bool ascii = pvSrc.ReadBoolean();
 
-			World.Broadcast(hue, ascii, message);
+			World.Broadcast(hue, false, message);
 
 			return new byte[] { 0x0A };
 		}
