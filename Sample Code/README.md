@@ -1,0 +1,1 @@
+The sample bot in this file was made using Python 3.8. I offer no guarantees that it will work out of the box, but it should work so long as you put in all of the appropriate information in your config files (both for the Python bot, and for the ServUO server side ones).
