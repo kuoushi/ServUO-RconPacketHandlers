@@ -1,4 +1,4 @@
-/***************************************************************************
+﻿/***************************************************************************
  *                     CustomRemoteAdminPacketHandlers.cs
  *                            -------------------
  *   begin                : Jan 24, 2022
@@ -153,16 +153,18 @@ namespace Server.RemoteAdmin
 
 		private static Dictionary<string, RconChallengeRecord> m_Challenges;
 		private static RconConfig rconConfig;
+		private static UdpClient udpListener;
 
 		public static void Configure()
 		{
 			rconConfig = new RconConfig("RconConfig.cfg");
 			m_Challenges = new Dictionary<string, RconChallengeRecord>();
+			udpListener = new UdpClient(rconConfig.ListenPort);
 
 			if (rconConfig.RelayEnabled())
 			{
 				Channel.AddStaticChannel(rconConfig.ChatChannel);
-				ChatActionHandlers.Register(0x61, true, new OnChatAction(RelayToDiscord));
+				ChatActionHandlers.Register(0x61, true, new OnChatAction(RelayChatPacket));
 			}
 
 			UDPListener();
@@ -172,18 +174,15 @@ namespace Server.RemoteAdmin
 		{
 			Task.Run(async () =>
 			{
-				using (var udpClient = new UdpClient(rconConfig.ListenPort))
-				{
-					Utility.PushColor(ConsoleColor.Green);
-					Console.WriteLine("RCON: Listening on *.*.*.*:{0}", rconConfig.ListenPort);
-					Utility.PopColor();
+				Utility.PushColor(ConsoleColor.Green);
+				Console.WriteLine("RCON: Listening on *.*.*.*:{0}", rconConfig.ListenPort);
+				Utility.PopColor();
 					
-					while(true)
-					{
-						var receivedResults = await udpClient.ReceiveAsync();
+				while(true)
+				{
+					var receivedResults = await udpListener.ReceiveAsync();
 						
-						ProcessPacket(receivedResults, udpClient);
-					}
+					ProcessPacket(receivedResults, udpListener);
 				}
 			});
 		}
@@ -266,20 +265,20 @@ namespace Server.RemoteAdmin
 			return false;
 		}
 
-		private static void RelayToDiscord(ChatUser from, Channel channel, string param)
+		private static void RelayChatPacket(ChatUser from, Channel channel, string param)
 		{
 			ChatActionHandlers.ChannelMessage(from, channel, param);
-			if(channel.Name == rconConfig.ChatChannel)
+			if(channel.Name == rconConfig.ChatChannel || rconConfig.ChatChannel == "*")
 			{
 				byte[] data = Encoding.ASCII.GetBytes("UO\tm\t" + from.Username + "\t" + param);
-				using (UdpClient c = new UdpClient(3896))
-					c.Send(data, data.Length, rconConfig.ChatPacketTargetAddress, rconConfig.ChatPacketTargetPort);
+				udpListener.Send(data, data.Length, rconConfig.ChatPacketTargetAddress, rconConfig.ChatPacketTargetPort);
 			}
 		}
 
 		private static byte[] GetChallenge(IPEndPoint remote, PacketReader pvSrc)
 		{
 			byte[] challengeBytes;
+			
 
 			if (m_Challenges.ContainsKey(remote.Address.ToString()))
 			{
@@ -296,7 +295,10 @@ namespace Server.RemoteAdmin
 			}
 
 			byte[] header = BitConverter.GetBytes((int)-1).Reverse().ToArray();
-			byte[] challenge = header.Append((byte)0x0A).Append((byte)0x20).Concat((byte[])challengeBytes).Append((byte)0x20).Append((byte)0x32).Append((byte)0x0A).ToArray();
+
+			byte[] challenge = { 0xFF, 0xFF, 0xFF, 0xFF, 0x0A, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0x32, 0x0A };
+			challengeBytes.CopyTo(challenge, 6);
+			// byte[] challenge = header.Append((byte)0x0A).Append((byte)0x20).Concat((byte[])challengeBytes).Append((byte)0x20).Append((byte)0x32).Append((byte)0x0A).ToArray();
 
 			return challenge;
 		}
