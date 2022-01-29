@@ -1,0 +1,31 @@
+{
+  "version": "0.1.0",
+  "login": {
+    "discord": {
+      "token": "bot account's token"
+    },
+    "uo": {
+      "rcon-password": "the rcon password you set in your RconConfig.cfg file goes here"
+    }
+  },
+  "discord-settings": {
+    "owner-id": "right click on the owner's user account -> Copy ID and paste here",
+    "server-id": "right click home server thumbnail -> Copy ID and paste here",
+    "home-channel-id": "right click channel to relay text/listen to commands on -> Copy ID and paste here",
+    "moderators": [
+      "right click on any moderators you want to be able to run commands -> Copy ID and paste to this list",
+      "this is an array, so more accounts can be added as needed"
+    ],
+    "discord-link": "invite link to your discord here"
+  },
+  "uo-settings": {
+    "server-ip": "ip address for the ServUO server",
+    "server-port": "port for the ServUO server",
+    "chat-channel": "Discord"
+  },
+  "listen-server": {
+    "listen-address": "this address can generally be left blank unless you need to change it for a specific reason (blank means it listens on all addresses)",
+    "listen-port": "port for the bot to receive messages on, this should match the port in your ServUO RconConfig.cfg file",
+    "enable-listen-server": true
+  }
+}
