@@ -40,24 +40,24 @@ Ex: 0xFF FF FF FF 1A 0A
 Send this command with no following parameters to request a challenge code from the server. The server will respond with a packet containing a series of random bytes that you will need to save, then use in all of the following commands. I recommend you get a fresh challenge code every time you send any command, but it isn't necessary just yet.
 
 Server will send a packet like the following as a response:
-0xFFFFFFFF 0A 20 1122334455667788 20 32 0A
+0xFF FF FF FF 0A 20 11 22 33 44 55 66 77 88 20 32 0A
 header > success byte > delim > 8 byte challenge code > delim > success > footer
 
 Broadcast
 0x1C
-Ex: 0xFF FF FF FF 1B (challenge) 00 (password) 00 (message) 00 (hue - int 32) 0A
+Ex: 0xFF FF FF FF 1B (challenge) (password) 00 (message) 00 (hue - int 32) 0A
 
 Send this command with a challenge, the password, and your desired message to broadcast a message to the whole server. You will also need to include a 4-byte integer to specify a hue.
 
 Channel Send
 0x1D
-Ex: 0xFF FF FF FF 1B (challenge) 00 (password) 00 (channel) 00 (message) 00 (hue - int 32) 0A
+Ex: 0xFF FF FF FF 1B (challenge) (password) 00 (channel) 00 (message) 00 (hue - int 32) 0A
 
 Send this command with a challenge, the password, your desired channel, and a message to send a message to a specific chat channel in the server. You will also need to include a 4-byte integer to specify a hue.
 
 Shutdown/Restart
 0x1F
-Ex: 0xFF FF FF FF 1B (challenge) 00 (password) 00 (save bool) (restart bool) 0A
+Ex: 0xFF FF FF FF 1B (challenge) (password) 00 (save bool) (restart bool) 0A
 
 Send this command with a challenge, the password, and then two 1-byte bools to specify whether or not the server should save and/or restart.
 
@@ -71,13 +71,13 @@ This command is used to refresh the last time a packet was sent from the given a
 (not yet implemented functions)
 Status
 0x1B
-Ex: 0xFF FF FF FF 1B (challenge) 00 (password) 00 0A
+Ex: 0xFF FF FF FF 1B (challenge) (password) 00 0A
 
 Send this command with a challenge and the password to request server status information. Response format is currently still being determined.
 
 Save
 0x1E
-Ex: 0xFF FF FF FF 1B (challenge) 00 (password) 00 0A
+Ex: 0xFF FF FF FF 1B (challenge) (password) 00 0A
 
 Send this command with a challenge and the password to start a server save.
 
