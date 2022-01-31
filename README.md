@@ -6,6 +6,7 @@ Installation
 Grab the Custom folder from this repo and drop it in your server's Scripts folder.
 
 The result should look like this:
+
 ServUO
 - Scripts
 - - Custom
@@ -67,6 +68,14 @@ Ex: 0xFF FF FF FF 1B (challenge) (password) 00 (channel) 00 (message) 00 (hue - 
 
 Send this command with a challenge, the password, your desired channel, and a message to send a message to a specific chat channel in the server. You will also need to include a 4-byte integer to specify a hue.
 
+Save
+
+0x1E
+
+Ex: 0xFF FF FF FF 1B (challenge) (password) 00 0A
+
+Send this command with a challenge and the password to start a server save.
+
 Shutdown/Restart
 
 0x1F
@@ -93,14 +102,6 @@ Status
 Ex: 0xFF FF FF FF 1B (challenge) (password) 00 0A
 
 Send this command with a challenge and the password to request server status information. Response format is currently still being determined.
-
-Save
-
-0x1E
-
-Ex: 0xFF FF FF FF 1B (challenge) (password) 00 0A
-
-Send this command with a challenge and the password to start a server save.
 
 Parameters
 -----
