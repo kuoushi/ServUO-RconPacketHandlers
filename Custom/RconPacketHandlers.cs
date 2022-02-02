@@ -32,6 +32,7 @@ using System.Linq;
 using Server.Misc;
 using Server.Network;
 using Server.Engines.Chat;
+using Server.Commands;
 
 namespace Server.RemoteAdmin
 {
@@ -46,12 +47,13 @@ namespace Server.RemoteAdmin
 			{ 0x1D, "send channel" },
 			{ 0x1E, "save" },
 			{ 0x1F, "shutdown" },
-			{ 0x20, "keepalive" }
+			{ 0x20, "keepalive" },
+			{ 0x21, "verify link" }
 		};
 
 		public RconPacketReader(byte[] data, int size) : base(data, size, true)
 		{
-			if(data.Length < 6) { m_Valid = false; return; }
+			if (data.Length < 6) { m_Valid = false; return; }
 			Seek(1, SeekOrigin.End);
 			var end = ReadByte();
 			Seek(0, SeekOrigin.Begin);
@@ -104,7 +106,7 @@ namespace Server.RemoteAdmin
 			m_Vars = new Dictionary<string, string>();
 			var path = Path.Combine("Scripts/Custom", filename);
 			FileInfo cfg = new FileInfo(path);
-			if(cfg.Exists)
+			if (cfg.Exists)
 			{
 				using (StreamReader stream = new StreamReader(cfg.FullName))
 				{
@@ -114,7 +116,7 @@ namespace Server.RemoteAdmin
 						if (!line.StartsWith("#"))
 						{
 							var parts = line.Split('=');
-							if(parts.Length == 2)
+							if (parts.Length == 2)
 							{
 								var key = parts[0];
 								var value = parts[1];
@@ -136,6 +138,13 @@ namespace Server.RemoteAdmin
 				return true;
 			return false;
 		}
+
+		public bool ExternalVerifyEnabled()
+		{
+			if(m_Vars.ContainsKey("AllowAccountLink") && m_Vars["AllowAccountLink"].ToLower() == "true")
+				return true;
+			return false;
+		}
 	}
 
 	public static class RconResponsePackets
@@ -148,23 +157,12 @@ namespace Server.RemoteAdmin
 
 	public static class RconPacketHandlers
 	{
-		private readonly static Dictionary<byte, Func<IPEndPoint, PacketReader, byte[]>> m_Funcs = new Dictionary<byte, Func<IPEndPoint, PacketReader, byte[]>>() {
-			{ 0x1B, Status },
-			{ 0x1C, WorldBroadcast },
-			{ 0x1D, ChannelSend }
-		};
-
-		private readonly static Dictionary<byte, Func<IPEndPoint, PacketReader, byte[]>> m_FuncsNoVerify = new Dictionary<byte, Func<IPEndPoint, PacketReader, byte[]>>() {
-			{ 0x1A, GetChallenge },
-			{ 0x20, KeepAlive }
-		};
-
-		private readonly static Dictionary<byte, Action<IPEndPoint, PacketReader>> m_Actions = new Dictionary<byte, Action<IPEndPoint, PacketReader>>() {
-			{ 0x1E, Save },
-			{ 0x1F, Shutdown }
-		};
+		private static readonly Dictionary<byte, Func<IPEndPoint, PacketReader, byte[]>> m_Funcs = new Dictionary<byte, Func<IPEndPoint, PacketReader, byte[]>>();
+		private static readonly Dictionary<byte, Func<IPEndPoint, PacketReader, byte[]>> m_FuncsNoVerify = new Dictionary<byte, Func<IPEndPoint, PacketReader, byte[]>>();
+		private static readonly Dictionary<byte, Action<IPEndPoint, PacketReader>> m_Actions = new Dictionary<byte, Action<IPEndPoint, PacketReader>>();
 
 		private static Dictionary<string, RconChallengeRecord> m_Challenges;
+		private static Dictionary<string, Tuple<int, DateTime>> m_AccountLinkChallenges = new Dictionary<string, Tuple<int, DateTime>>();
 		private static RconConfig rconConfig;
 		private static UdpClient udpListener;
 
@@ -174,13 +172,52 @@ namespace Server.RemoteAdmin
 			m_Challenges = new Dictionary<string, RconChallengeRecord>();
 			udpListener = new UdpClient(rconConfig.ListenPort);
 
+			m_FuncsNoVerify.Add(0x1A, GetChallenge);
+			m_Funcs.Add(        0x1B, Status);
+			m_Funcs.Add(        0x1C, WorldBroadcast);
+			m_Funcs.Add(        0x1D, ChannelSend);
+			m_Actions.Add(      0x1E, Save);
+			m_Actions.Add(      0x1F, Shutdown);
+			m_FuncsNoVerify.Add(0x20, KeepAlive);
+
 			if (rconConfig.RelayEnabled())
 			{
-				Channel.AddStaticChannel(rconConfig.ChatChannel);
+				if (rconConfig.ChatChannel != "*")
+				{
+					Channel.AddStaticChannel(rconConfig.ChatChannel);
+				}
 				ChatActionHandlers.Register(0x61, true, new OnChatAction(RelayChatPacket));
 			}
 
+			if(rconConfig.ExternalVerifyEnabled())
+			{
+				CommandHandlers.Register("VerifyExternal", AccessLevel.Player, SendVerifyPacket_OnCommand);
+				m_Funcs.Add(0x21, VerifyExternal);
+			}
+			
 			UDPListener();
+		}
+
+		[Usage("VerifyExternal")]
+		[Description("Sends a verification response to the requester.")]
+		private static void SendVerifyPacket_OnCommand(CommandEventArgs e)
+		{
+			var from = e.Mobile;
+			var confirmation = e.GetInt32(0);
+
+			if(confirmation == 0 || !m_AccountLinkChallenges.ContainsKey(from.Account.Username))
+            {
+				return;
+			}
+
+			if(m_AccountLinkChallenges[from.Account.Username].Item1 != confirmation)
+			{
+				return;
+			}
+
+			byte[] data = Encoding.ASCII.GetBytes("UO\tv\t" + from.Account.Username + "\t" + confirmation);
+			udpListener.Send(data, data.Length, rconConfig.ChatPacketTargetAddress, rconConfig.ChatPacketTargetPort);
+			m_AccountLinkChallenges.Remove(from.Account.Username);
 		}
 
 		private static void UDPListener()
@@ -190,11 +227,11 @@ namespace Server.RemoteAdmin
 				Utility.PushColor(ConsoleColor.Green);
 				Console.WriteLine("RCON: Listening on *.*.*.*:{0}", rconConfig.ListenPort);
 				Utility.PopColor();
-					
-				while(true)
+
+				while (true)
 				{
 					var receivedResults = await udpListener.ReceiveAsync();
-						
+
 					ProcessPacket(receivedResults, udpListener);
 				}
 			});
@@ -203,7 +240,7 @@ namespace Server.RemoteAdmin
 		private static void ProcessPacket(UdpReceiveResult data, UdpClient client)
 		{
 			var packetReader = new RconPacketReader(data.Buffer, data.Buffer.Length);
-			if(!packetReader.IsValid)
+			if (!packetReader.IsValid)
 			{
 				client.Send(RconResponsePackets.Fail, 1, data.RemoteEndPoint);
 				return;
@@ -248,7 +285,7 @@ namespace Server.RemoteAdmin
 					client.Send(response, response.Length, data.RemoteEndPoint);
 				}
 			}
-			catch(Exception ex)
+			catch (Exception ex)
 			{
 				Console.WriteLine(ex.Message);
 			}
@@ -259,20 +296,20 @@ namespace Server.RemoteAdmin
 			try
 			{
 				var challenge = new byte[8];
-				for(int i = 0; i < 8; i++)
+				for (int i = 0; i < 8; i++)
 				{
 					challenge[i] = pvSrc.ReadByte();
 				}
-				if (m_Challenges.ContainsKey(remote.Address.ToString()) && m_Challenges[remote.Address.ToString()].Challenge.SequenceEqual(challenge))
+				if (m_Challenges.ContainsKey(remote.Address.ToString()) && m_Challenges[remote.Address.ToString()].Challenge.SequenceEqual(challenge) && m_Challenges[remote.Address.ToString()].LastChallenge > DateTime.Now.AddMinutes(-30))
 				{
 					return true;
 				}
 			}
-			catch(Exception ex)
+			catch (Exception ex)
 			{
 				Console.WriteLine(ex.Message);
 			}
-			
+
 			return false;
 		}
 
@@ -307,13 +344,14 @@ namespace Server.RemoteAdmin
 				return RconResponsePackets.InvalidPassword;
 			}
 
+			m_Challenges[remote.Address.ToString()].Refresh();
 			return RconResponsePackets.Success;
 		}
 
 		private static void RelayChatPacket(ChatUser from, Channel channel, string param)
 		{
 			ChatActionHandlers.ChannelMessage(from, channel, param);
-			if(channel.Name == rconConfig.ChatChannel || rconConfig.ChatChannel == "*")
+			if (channel.Name == rconConfig.ChatChannel || rconConfig.ChatChannel == "*")
 			{
 				byte[] data = Encoding.ASCII.GetBytes("UO\tm\t" + channel.Name + "\t" + from.Username + "\t" + param);
 				udpListener.Send(data, data.Length, rconConfig.ChatPacketTargetAddress, rconConfig.ChatPacketTargetPort);
@@ -342,7 +380,7 @@ namespace Server.RemoteAdmin
 
 			byte[] challenge = { 0xFF, 0xFF, 0xFF, 0xFF, 0x0A, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0x32, 0x0A };
 			challengeBytes.CopyTo(challenge, 6);
-			
+
 			return challenge;
 		}
 
@@ -365,7 +403,7 @@ namespace Server.RemoteAdmin
 			// bool ascii_text = pvSrc.ReadBoolean();
 			Channel channel = Channel.FindChannelByName(channel_name);
 
-			if(channel != null)
+			if (channel != null)
 			{
 				foreach (ChatUser user in channel.Users)
 				{
@@ -385,7 +423,7 @@ namespace Server.RemoteAdmin
 
 		private static byte[] KeepAlive(IPEndPoint remote, PacketReader pvSrc)
 		{
-			if(m_Challenges.ContainsKey(remote.Address.ToString()))
+			if (m_Challenges.ContainsKey(remote.Address.ToString()))
 			{
 				m_Challenges[remote.Address.ToString()].Refresh();
 			}
@@ -416,6 +454,50 @@ namespace Server.RemoteAdmin
 
 		private static byte[] Status(IPEndPoint remote, PacketReader pvSrc)
 		{
+			string shardName = Config.Get("Server.Name", "Shard Name");
+			int online = 0, total = Mobiles.PlayerMobile.Instances.Count;
+
+			foreach(var mob in Mobiles.PlayerMobile.Instances)
+			{
+				if(mob.NetState != null)
+				{
+					online++;
+				}
+			}
+
+			int account_total = Accounting.Accounts.Count;
+			
+			// Console.WriteLine("{0}: {1}/{2}/{3}", shardName, online, total, account_total);
+
+			return RconResponsePackets.Success;
+		}
+
+		private static byte[] VerifyExternal(IPEndPoint remote, PacketReader pvSrc)
+		{
+			int code = pvSrc.ReadInt32();
+			string accountName = pvSrc.ReadString();
+			var acc = (Accounting.Account)Accounting.Accounts.GetAccount(accountName);
+
+			Mobile m_Found = null;
+			for(var i = 0; i < acc.Length; i++)
+			{
+				var mob = acc[i];
+				if(mob == null || mob.NetState == null)
+					continue;
+
+				m_Found = mob;
+				break;
+			}
+
+			if (m_Found == null)
+				return RconResponsePackets.Fail;
+
+			var x = new Tuple<int, DateTime>(code, DateTime.Now);
+			m_AccountLinkChallenges.Add(accountName, x);
+
+			m_Found.SendMessage(0, "An external source has requested to link with your account. Please use the following command.");
+			m_Found.SendMessage(0, "[VerifyExternal {0}", code);
+
 			return RconResponsePackets.Success;
 		}
 	}
