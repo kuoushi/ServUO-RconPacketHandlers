@@ -1,4 +1,7 @@
 import asyncio
+import random
+import datetime
+
 from async_timeout import timeout
 
 
@@ -38,12 +41,20 @@ class AsyncUORcon:
     end_bytes = b'\n'
     packet_size = 1024
 
+    challenges = {}
+
     def __init__(self, host='127.0.0.1', port=27030, password='', loop=None):
         self.host = host
         self.port = int(port)
         self.password = password
         if loop:
             self.loop = loop
+
+    def verify_check(self, name: str, code: int):
+        if name in self.challenges and self.challenges[name][0] == code:
+            del self.challenges[name]
+            return True
+        return False
 
     async def send_wait_response(self, message, timeout_param=1.5):
         on_con_lost = self.loop.create_future()
@@ -91,6 +102,8 @@ class AsyncUORcon:
 
         msg += self.end_bytes
 
+        # print(msg)
+
         if 'timeout_param' in kwargs.items():
             response = await self.send_wait_response(msg, timeout_param=kwargs['timeout_param'])
         else:
@@ -100,8 +113,8 @@ class AsyncUORcon:
     async def send_channel_chat(self, channel, message, hue=0, ascii_text=False):
         return await self.rcon(b'\x1D', channel, message, hue, ascii_text)
 
-    async def broadcast(self, message: str, hue=1, ascii_text=False):
-        return await self.rcon(b'\x1C', message, hue, ascii_text)
+    async def broadcast(self, message: str, hue=1, ascii_text=False, staff_level=0):
+        return await self.rcon(b'\x1C', message, hue, staff_level, ascii_text)
 
     async def keep_alive(self):
         return await self.rcon_no_auth(b'\x20')
@@ -112,17 +125,29 @@ class AsyncUORcon:
     async def server_shutdown(self, save=True, restart=False):
         return await self.rcon(b'\x1F', save, restart)
 
+    async def server_status(self):
+        return await self.rcon(b'\x1B')
+
+    async def verify(self, account: str, code=-1):
+        if code == -1:
+            code = random.randint(10000, 99999)
+        self.challenges[account] = (code, datetime.datetime.now())
+        return await self.rcon(b'\x21', code, account)
+
+    async def kickban(self, name: str, is_account=False, kick=False, ban=False):
+        return await self.rcon(b'\x22', ban, kick, is_account, name)
+
+    async def unban(self, name: str):
+        return await self.rcon(b'\x23', name)
+
+    async def online_users(self, start_index=0, max_entries=20):
+        return await self.rcon(b'\x24', start_index, max_entries)
+
 
 async def main(loop):
+    # for testing library directly
     x = AsyncUORcon('127.0.0.1', port=27030, password='passwordgoeshere', loop=loop)
-    print(await x.send_channel_chat("Discord", "Channel message test.", hue=57))
-    print(await x.send_channel_chat("General", "Channel message test.", hue=57))
-    print(await x.broadcast("Here's a broadcast message.", hue=5))
-    print(await x.keep_alive())
-    # print(await x.server_save())
-    # print(await x.server_shutdown(restart=True))
-    await asyncio.sleep(15)
-    print(await x.broadcast("Here's a broadcast message again.", hue=5))
+    # print(await x.server_status())
 
 if __name__ == "__main__":
     loop = asyncio.get_event_loop()

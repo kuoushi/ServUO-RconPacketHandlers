@@ -88,20 +88,34 @@ class UOMessage(BaseMessage):
 
         mstring = data.replace(b'\xff', b'').replace(b'\x00', b'').replace(b'\n', b'').decode("ascii")
         split = mstring.split("\t")
+        self.log_type = None
 
         self.chat_message = False
-        if bool(split[1]):
+        if split[1] == "m":
             self.chat_message = True
+            self.log_type = "chat message"
+            self.location += f" | {split[2]}"
 
-        author = split[2]
-        m = re.search("^<([0-9]+)>(.+)$", author)
-        if m:
-            self.author = m.group(2)
-            self.id = int(m.group(1))
-        else:
-            self.author = author
-            self.id = -1
-        self.message = split[3]
+            author = split[3]
+            m = re.search("^<([0-9]+)>(.+)$", author)
+            if m:
+                self.author = m.group(2)
+                self.id = int(m.group(1))
+            else:
+                self.author = author
+                self.id = -1
+            self.message = split[4]
+        elif split[1] == "v":
+            self.chat_message = False
+            self.log_type = "verify"
+            self.author = split[2]
+            self.message = int(split[3])
+        elif split[1] == "mw":
+            self.chat_message = False
+            self.log_type = "world message"
+            self.author = split[2]
+            self.location += f" ({', '.join(split[3].split(' '))})"
+            self.message = split[4]
 
     def relay_string(self, target_service=False):
         return f'{self.service.upper()} | {self.author}: {self.message}'
@@ -140,11 +154,13 @@ class UO(discord_commands.Cog):
 
         if data[0:2] == b'UO':
             message = UOMessage(data=data, location=source)
-            if message.chat_message:
+            if message.chat_message or message.log_type == "world message":
                 print(message)
                 await self.discord_bot.on_service_message(message)
-            else:
-                pass
+            elif message.log_type == "verify":
+                if self.rcon_socket.verify_check(message.author, int(message.message)):
+                    relay_channel = self.discord_bot.get_channel(self.discord_bot.config.get_discord_home_channel())
+                    await relay_channel.send(f"The {message.author} account is now linked.")
 
     async def keep_alive(self):
         while True:
@@ -185,6 +201,59 @@ class UO(discord_commands.Cog):
             await self.rcon_socket.server_shutdown()
         elif "restart" == sanitized:
             await self.rcon_socket.server_shutdown(restart=True)
+        elif "status" == sanitized:
+            res = await self.rcon_socket.server_status()
+            if res != b'\xFF':
+                item_count = int.from_bytes(res[-5:-1], "big")
+                account_count = int.from_bytes(res[-9:-5], "big")
+                character_count = int.from_bytes(res[-13:-9], "big")
+                online_character_count = int.from_bytes(res[-17:-13], "big")
+                shard_name = res[5:-18].decode("utf-8")
+                concat_string = f"{shard_name} - {online_character_count}/{character_count} characters online, {account_count} accounts, {item_count} items"
+                # print(concat_string)
+                await ctx.send(concat_string)
+        elif "verify" == sanitized:
+            res = await self.rcon_socket.verify(args[0])
+            if res != b'\xFF':
+                await ctx.send(f"Sent a verification code to {args[0]} in-game.")
+        elif "kick" == sanitized:
+            res = await self.rcon_socket.kickban(args[0], kick=True, ban=False)
+            if res != b'\xFF':
+                await ctx.send(f"{args[0]} kicked.")
+        elif "ban" == sanitized:
+            res = await self.rcon_socket.kickban(args[0], kick=False, ban=True)
+            if res != b'\xFF':
+                await ctx.send(f"{args[0]} banned.")
+        elif "kickban" == sanitized:
+            res = await self.rcon_socket.kickban(args[0], kick=True, ban=True)
+            if res != b'\xFF':
+                await ctx.send(f"{args[0]} kicked and banned.")
+        elif "unban" == sanitized:
+            res = await self.rcon_socket.unban(args[0])
+            if res != b'\xFF':
+                await ctx.send(f"{args[0]} kicked and banned.")
+        elif "online" == sanitized:
+            res = await self.rcon_socket.online_users()
+            if res != b'\xFF':
+                t = res[5:-1]
+                if t == b'':
+                    await ctx.send("No players online.")
+                else:
+                    t = t.split(b'\n')
+                    concat_string = "Character (Account) | Region (coords) | IP\n"
+
+                    for x in t:
+                        if x:
+                            player = x.split(b'\t')
+                            name = player[0].decode("utf-8")
+                            account = player[1].decode("utf-8")
+                            region = player[2].decode("utf-8")
+                            loc = player[3].split(b',')
+                            ip = player[4].decode("utf-8")
+                            concat_string += f"{name} ({account}) | {region} ({loc[0].decode('utf-8')}x{loc[1].decode('utf-8')}y{loc[2].decode('utf-8')}z) | {ip}\n"
+
+                    # print(concat_string)
+                    await ctx.send(concat_string)
 
 
 class UOBotDiscord(discord_commands.Bot):
