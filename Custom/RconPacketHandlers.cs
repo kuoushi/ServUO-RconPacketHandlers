@@ -48,7 +48,10 @@ namespace Server.RemoteAdmin
 			{ 0x1E, "save" },
 			{ 0x1F, "shutdown" },
 			{ 0x20, "keepalive" },
-			{ 0x21, "verify link" }
+			{ 0x21, "verify link" },
+			{ 0x22, "kick/ban user" },
+			{ 0x23, "unban user" },
+			{ 0x24, "get online users" }
 		};
 
 		public RconPacketReader(byte[] data, int size) : base(data, size, true)
@@ -98,6 +101,9 @@ namespace Server.RemoteAdmin
 		public string ChatPacketTargetAddress => m_Vars["ChatPacketTargetAddress"];
 		public int ChatPacketTargetPort => Int32.Parse(m_Vars["ChatPacketTargetPort"]);
 		public string ChatChannel => m_Vars["ChatChannel"];
+		public bool AutoJoinChatChannel => IsBooleanKeyEnabled("AutoJoinChatChannel");
+		public bool AllowAccountLink => IsBooleanKeyEnabled("AllowAccountLink");
+		public bool WorldChatLog => IsBooleanKeyEnabled("WorldChatLog");
 
 		private Dictionary<string, string> m_Vars;
 
@@ -139,9 +145,9 @@ namespace Server.RemoteAdmin
 			return false;
 		}
 
-		public bool ExternalVerifyEnabled()
+		private bool IsBooleanKeyEnabled(string key)
 		{
-			if(m_Vars.ContainsKey("AllowAccountLink") && m_Vars["AllowAccountLink"].ToLower() == "true")
+			if (m_Vars.ContainsKey(key) && m_Vars[key].ToLower() == "true")
 				return true;
 			return false;
 		}
@@ -149,10 +155,10 @@ namespace Server.RemoteAdmin
 
 	public static class RconResponsePackets
 	{
-		public static byte[] Success = new byte[] { 0x0A };
-		public static byte[] Fail = new byte[] { 0xFF };
-		public static byte[] InvalidChallenge = new byte[] { 0xF0 };
-		public static byte[] InvalidPassword = new byte[] { 0xF1 };
+		public static byte[] Success = { 0x0A };
+		public static byte[] Fail = { 0xFF };
+		public static byte[] InvalidChallenge = { 0xF0 };
+		public static byte[] InvalidPassword = { 0xF1 };
 	}
 
 	public static class RconPacketHandlers
@@ -168,6 +174,9 @@ namespace Server.RemoteAdmin
 
 		public static void Configure()
 		{
+			EventSink.Connected += EventSink_Connected;
+			EventSink.Disconnected += EventSink_Disconnected;
+
 			rconConfig = new RconConfig("RconConfig.cfg");
 			m_Challenges = new Dictionary<string, RconChallengeRecord>();
 			udpListener = new UdpClient(rconConfig.ListenPort);
@@ -179,23 +188,65 @@ namespace Server.RemoteAdmin
 			m_Actions.Add(      0x1E, Save);
 			m_Actions.Add(      0x1F, Shutdown);
 			m_FuncsNoVerify.Add(0x20, KeepAlive);
+			m_Funcs.Add(        0x22, KickBanUser);
+			m_Funcs.Add(        0x23, UnbanUser);
+			m_Funcs.Add(        0x24, GetOnlineUsers);
 
 			if (rconConfig.RelayEnabled())
 			{
 				if (rconConfig.ChatChannel != "*")
 				{
 					Channel.AddStaticChannel(rconConfig.ChatChannel);
+					if (rconConfig.AutoJoinChatChannel)
+					{
+						EventSink.Login += EventSink_Login;
+
+						// quietly ignore General channel join attempt on player login for 5 seconds
+						// ClassicUO client sends a join request when entering the game, but we want players in our channel
+						ChatActionHandlers.Register(0x62, false, new OnChatAction(BlockGeneralAtLogin));
+					}
 				}
 				ChatActionHandlers.Register(0x61, true, new OnChatAction(RelayChatPacket));
 			}
 
-			if(rconConfig.ExternalVerifyEnabled())
+			if (rconConfig.AllowAccountLink)
 			{
 				CommandHandlers.Register("VerifyExternal", AccessLevel.Player, SendVerifyPacket_OnCommand);
 				m_Funcs.Add(0x21, VerifyExternal);
 			}
-			
+
+			if (rconConfig.WorldChatLog)
+				EventSink.Speech += EventSink_Speech;
+
 			UDPListener();
+		}
+
+		private static void EventSink_Connected(ConnectedEventArgs e)
+		{
+			// to send log when user connects
+		}
+
+		private static void EventSink_Login(LoginEventArgs e)
+		{
+			var from = e.Mobile;
+			var defaultChannel = Channel.FindChannelByName(rconConfig.ChatChannel);
+			var chatUser = ChatUser.AddChatUser(from);
+			defaultChannel.AddUser(chatUser);
+		}
+
+		private static void EventSink_Disconnected(DisconnectedEventArgs e)
+		{
+			// to send log when user disconnects
+		}
+
+		private static void EventSink_Speech(SpeechEventArgs e)
+		{
+			Mobile from = e.Mobile;
+			if (from is Mobiles.PlayerMobile)
+			{
+				byte[] data = Encoding.ASCII.GetBytes("UO\tmw\t" + from.Name + "\t" + from.X + " " + from.Y + " " + from.Z + "\t" + e.Speech);
+				udpListener.Send(data, data.Length, rconConfig.ChatPacketTargetAddress, rconConfig.ChatPacketTargetPort);
+			}
 		}
 
 		[Usage("VerifyExternal")]
@@ -348,6 +399,13 @@ namespace Server.RemoteAdmin
 			return RconResponsePackets.Success;
 		}
 
+		public static void BlockGeneralAtLogin(ChatUser from, Channel channel, string param)
+		{
+			if (param.Contains("General") && from.Mobile.NetState.ConnectedFor.TotalSeconds < 5)
+				return;
+
+			ChatActionHandlers.JoinChannel(from, channel, param);
+		}
 		private static void RelayChatPacket(ChatUser from, Channel channel, string param)
 		{
 			ChatActionHandlers.ChannelMessage(from, channel, param);
@@ -388,10 +446,15 @@ namespace Server.RemoteAdmin
 		{
 			string message = pvSrc.ReadUTF8String();
 			int hue = pvSrc.ReadInt32();
+			int access = pvSrc.ReadInt32();
 			// bool ascii = pvSrc.ReadBoolean();
 
-			World.Broadcast(hue, false, message);
+			if (access > 10 || access < 0)
+				return RconResponsePackets.Fail;
 
+			AccessLevel accessLevel = (AccessLevel)access;
+
+			World.Broadcast(hue, false, accessLevel, message);
 			return RconResponsePackets.Success;
 		}
 
@@ -437,6 +500,7 @@ namespace Server.RemoteAdmin
 
 		private static void Save(IPEndPoint remote, PacketReader pvSrc)
 		{
+			CommandLogging.WriteLine(null, "RCON saving the server");
 			AutoSave.Save();
 		}
 
@@ -444,7 +508,8 @@ namespace Server.RemoteAdmin
 		{
 			bool save = pvSrc.ReadBoolean();
 			bool restart = pvSrc.ReadBoolean();
-			Console.WriteLine("RCON: shutting down server (Restart: {0}) (Save: {1}) [{2}]", restart, save, DateTime.Now);
+			Console.WriteLine("RCON: Shutting down server (Restart: {0}) (Save: {1}) [{2}]", restart, save, DateTime.Now);
+			CommandLogging.WriteLine(null, "RCON shutting down server (Restart: {0}) (Save: {1}) [{2}]", restart, save, DateTime.Now);
 
 			if (save && !AutoRestart.Restarting)
 				AutoSave.Save();
@@ -454,22 +519,16 @@ namespace Server.RemoteAdmin
 
 		private static byte[] Status(IPEndPoint remote, PacketReader pvSrc)
 		{
-			string shardName = Config.Get("Server.Name", "Shard Name");
-			int online = 0, total = Mobiles.PlayerMobile.Instances.Count;
+			string shardName = ServerList.ServerName;
+			int userTotalCount = Mobiles.PlayerMobile.Instances.Count;
+			int userOnlineCount = NetState.Instances.Count;
+			int itemTotalCount = World.Items.Count;
+			int accountTotalCount = Accounting.Accounts.Count;
 
-			foreach(var mob in Mobiles.PlayerMobile.Instances)
-			{
-				if(mob.NetState != null)
-				{
-					online++;
-				}
-			}
+			byte[] result = { 0xFF, 0xFF, 0xFF, 0xFF, 0x0A };
+			result = result.Concat(Encoding.ASCII.GetBytes(shardName)).Append((byte)0x00).Concat(BitConverter.GetBytes(userOnlineCount).Reverse()).Concat(BitConverter.GetBytes(userTotalCount).Reverse()).Concat(BitConverter.GetBytes(accountTotalCount).Reverse()).Concat(BitConverter.GetBytes(itemTotalCount).Reverse()).Append((byte)0x0A).ToArray();
 
-			int account_total = Accounting.Accounts.Count;
-			
-			// Console.WriteLine("{0}: {1}/{2}/{3}", shardName, online, total, account_total);
-
-			return RconResponsePackets.Success;
+			return result;
 		}
 
 		private static byte[] VerifyExternal(IPEndPoint remote, PacketReader pvSrc)
@@ -498,7 +557,132 @@ namespace Server.RemoteAdmin
 			m_Found.SendMessage(0, "An external source has requested to link with your account. Please use the following command.");
 			m_Found.SendMessage(0, "[VerifyExternal {0}", code);
 
+			CommandLogging.WriteLine(null, "RCON sending verification request ({0}) to {1}", code, CommandLogging.Format(acc));
 			return RconResponsePackets.Success;
+		}
+
+		private static byte[] KickBanUser(IPEndPoint remote, PacketReader pvSrc)
+		{
+			bool ban = pvSrc.ReadBoolean();
+			bool kick = pvSrc.ReadBoolean();
+
+			if (!kick && !ban)
+				return RconResponsePackets.Fail;
+
+			bool accountType = pvSrc.ReadBoolean();
+			string name = pvSrc.ReadString();
+
+			if (accountType)
+			{
+				var acc = Accounting.Accounts.GetAccount(name);
+				if(acc != null)
+				{
+					KickBanAccount(acc, kick, ban);
+					return RconResponsePackets.Success;
+				}
+			}
+			else
+			{
+				foreach (var x in NetState.Instances)
+				{
+					if (x == null)
+						continue;
+
+					if (x.Mobile.Name == name)
+					{
+						KickBanMobile(x.Mobile, kick, ban);
+						return RconResponsePackets.Success;
+					}
+				}
+			}
+
+			return RconResponsePackets.Fail;
+		}
+
+		private static void KickBanMobile(Mobile to, bool kick, bool ban)
+		{
+			if (kick)
+			{
+				to.NetState.Dispose();
+				CommandLogging.WriteLine(null, "RCON kicking {0}", CommandLogging.Format(to));
+			}
+			if (ban)
+			{
+				to.Account.Banned = true;
+				CommandLogging.WriteLine(null, "RCON banning {0}", CommandLogging.Format(to.Account));
+			}
+		}
+
+		private static void KickBanAccount(Accounting.IAccount to, bool kick, bool ban)
+		{
+			if (kick)
+			{
+				Mobile m_Found = null;
+				for (var i = 0; i < to.Length; i++)
+				{
+					var mob = to[i];
+					if (mob == null || mob.NetState == null)
+						continue;
+
+					m_Found = mob;
+					break;
+				}
+
+				if (m_Found != null)
+				{
+					m_Found.NetState.Dispose();
+					CommandLogging.WriteLine(null, "RCON kicking {0}", CommandLogging.Format(m_Found));
+				}
+			}
+			if (ban)
+			{
+				to.Banned = true;
+				CommandLogging.WriteLine(null, "RCON banning {0}", CommandLogging.Format(to));
+			}
+		}
+
+		private static byte[] UnbanUser(IPEndPoint remote, PacketReader pvSrc)
+		{
+			string name = pvSrc.ReadString();
+			var acc = Accounting.Accounts.GetAccount(name);
+
+			if (acc == null)
+				return RconResponsePackets.Fail;
+
+			acc.Banned = false;
+			CommandLogging.WriteLine(null, "RCON unbanning {0}", CommandLogging.Format(acc));
+			return RconResponsePackets.Success;
+		}
+
+		private static byte[] GetOnlineUsers(IPEndPoint remote, PacketReader pvSrc)
+		{
+			int startIndex = pvSrc.ReadInt32();
+			int maxEntries = pvSrc.ReadInt32();
+			
+			if (maxEntries == 0 || maxEntries < -1)
+				return RconResponsePackets.Fail;
+
+			byte[] return_packet = new byte[] { 0xFF, 0xFF, 0xFF, 0xFF, 0x0A };
+			int i = -1;
+			foreach (var ns in NetState.Instances)
+			{
+				if (ns == null)
+					continue;
+
+				i++;
+				if (i < startIndex)
+					continue;
+
+				if (maxEntries != -1 && i > maxEntries - 1)
+					break;
+
+				var mob = ns.Mobile;
+				byte[] packet = Encoding.ASCII.GetBytes(mob.Name + "\t" + mob.Account.Username + "\t" + mob.Region.Name + "\t" + mob.Location.X + "," + mob.Location.Y + "," + mob.Location.Z + "\t" + ns.Address.ToString() + "\n");
+				return_packet = return_packet.Concat(packet).ToArray();
+			}
+
+			return_packet = return_packet.Append((byte)0x0A).ToArray();
+			return return_packet;
 		}
 	}
 }
