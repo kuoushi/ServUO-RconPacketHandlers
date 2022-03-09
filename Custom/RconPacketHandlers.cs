@@ -1,4 +1,4 @@
-﻿/***************************************************************************
+/***************************************************************************
  *                     CustomRemoteAdminPacketHandlers.cs
  *                            -------------------
  *   begin                : Jan 24, 2022
@@ -51,7 +51,9 @@ namespace Server.RemoteAdmin
 			{ 0x21, "verify link" },
 			{ 0x22, "kick/ban user" },
 			{ 0x23, "unban user" },
-			{ 0x24, "get online users" }
+			{ 0x24, "get online users" },
+			{ 0x25, "add log packet target" },
+			{ 0x26, "remove log packet target" }
 		};
 
 		public RconPacketReader(byte[] data, int size) : base(data, size, true)
@@ -94,22 +96,51 @@ namespace Server.RemoteAdmin
 		}
 	}
 
+	public enum LogEvent
+	{
+		Speech,
+		Login,
+		Logout,
+		Connected,
+		Disconnected,
+		Shutdown,
+		PlayerMurdered,
+		PlayerDeath,
+		OnKilledBy,
+		OnEnterRegion,
+		CreateGuild,
+		JoinGuild,
+		CharacterCreated,
+		Crashed,
+		HelpRequest,
+		RenameRequest,
+		DeleteRequest,
+		QuestComplete,
+		AccountLogin,
+		GameLogin,
+		ClientTypeReceived,
+		ClientVersionReceived
+	}
+
 	public class RconConfig
 	{
+		public List<IPEndPoint> LogTargets => m_Targets;
 		public string RconPassword => m_Vars["RconPassword"];
 		public int ListenPort => Int32.Parse(m_Vars["ListenPort"]);
-		public string ChatPacketTargetAddress => m_Vars["ChatPacketTargetAddress"];
-		public int ChatPacketTargetPort => Int32.Parse(m_Vars["ChatPacketTargetPort"]);
+		public int LogTypes => Int32.Parse(m_Vars["LogTypes"]);
 		public string ChatChannel => m_Vars["ChatChannel"];
 		public bool AutoJoinChatChannel => IsBooleanKeyEnabled("AutoJoinChatChannel");
 		public bool AllowAccountLink => IsBooleanKeyEnabled("AllowAccountLink");
-		public bool WorldChatLog => IsBooleanKeyEnabled("WorldChatLog");
+		public bool EnableRcon => IsBooleanKeyEnabled("RconService");
+		public bool EnableRelay => IsBooleanKeyEnabled("EnableChatRelay");
 
 		private Dictionary<string, string> m_Vars;
+		private List<IPEndPoint> m_Targets;
 
 		public RconConfig(string filename)
 		{
 			m_Vars = new Dictionary<string, string>();
+			m_Targets = new List<IPEndPoint>();
 			var path = Path.Combine("Scripts/Custom", filename);
 			FileInfo cfg = new FileInfo(path);
 			if (cfg.Exists)
@@ -136,19 +167,55 @@ namespace Server.RemoteAdmin
 			{
 				throw new Exception("RconConfig.cfg file is missing.");
 			}
-		}
 
-		public bool RelayEnabled()
-		{
-			if (m_Vars.ContainsKey("ChatPacketTargetAddress") && m_Vars.ContainsKey("ChatPacketTargetPort") && m_Vars.ContainsKey("ChatChannel"))
-				return true;
-			return false;
+			if (m_Vars.ContainsKey("LogTargets"))
+			{
+				foreach (var address in m_Vars["LogTargets"].Replace(" ", string.Empty).Split(','))
+				{
+					var split = address.Split(':');
+					AddLogTarget(split[0], Int32.Parse(split[1]));
+				}
+			}
 		}
 
 		private bool IsBooleanKeyEnabled(string key)
 		{
 			if (m_Vars.ContainsKey(key) && m_Vars[key].ToLower() == "true")
 				return true;
+			return false;
+		}
+
+		public bool IsLogTypeEnabled(LogEvent key)
+		{
+			if (((LogTypes >> (int) key) & 1) == 1)
+				return true;
+			return false;
+		}
+
+		public void AddLogTarget(string address, int port)
+		{
+			var add = new IPEndPoint(IPAddress.Parse(address), port);
+			if (!DoesTargetExist(add))
+				m_Targets.Add(add);
+		}
+
+		public void RemoveLogTarget(string address, int port)
+		{
+			var remove = new IPEndPoint(IPAddress.Parse(address), port);
+			foreach (var target in m_Targets)
+			{
+				if (remove.Equals(remove))
+					m_Targets.Remove(target);
+			}
+		}
+
+		public bool DoesTargetExist(IPEndPoint check)
+		{
+			foreach (var target in m_Targets)
+			{
+				if (target.Equals(check))
+					return true;
+			}
 			return false;
 		}
 	}
@@ -163,90 +230,285 @@ namespace Server.RemoteAdmin
 
 	public static class RconPacketHandlers
 	{
-		private static readonly Dictionary<byte, Func<IPEndPoint, PacketReader, byte[]>> m_Funcs = new Dictionary<byte, Func<IPEndPoint, PacketReader, byte[]>>();
-		private static readonly Dictionary<byte, Func<IPEndPoint, PacketReader, byte[]>> m_FuncsNoVerify = new Dictionary<byte, Func<IPEndPoint, PacketReader, byte[]>>();
-		private static readonly Dictionary<byte, Action<IPEndPoint, PacketReader>> m_Actions = new Dictionary<byte, Action<IPEndPoint, PacketReader>>();
+		private static Dictionary<byte, Func<IPEndPoint, PacketReader, byte[]>> m_Funcs = new Dictionary<byte, Func<IPEndPoint, PacketReader, byte[]>>();
+		private static Dictionary<byte, Func<IPEndPoint, PacketReader, byte[]>> m_FuncsNoVerify = new Dictionary<byte, Func<IPEndPoint, PacketReader, byte[]>>();
+		private static Dictionary<byte, Action<IPEndPoint, PacketReader>> m_Actions = new Dictionary<byte, Action<IPEndPoint, PacketReader>>();
 
 		private static Dictionary<string, RconChallengeRecord> m_Challenges;
 		private static Dictionary<string, Tuple<int, DateTime>> m_AccountLinkChallenges = new Dictionary<string, Tuple<int, DateTime>>();
 		private static RconConfig rconConfig;
 		private static UdpClient udpListener;
+		private static bool m_StopListening = false;
 
 		public static void Configure()
 		{
-			EventSink.Connected += EventSink_Connected;
-			EventSink.Disconnected += EventSink_Disconnected;
-
 			rconConfig = new RconConfig("RconConfig.cfg");
 			m_Challenges = new Dictionary<string, RconChallengeRecord>();
 			udpListener = new UdpClient(rconConfig.ListenPort);
 
-			m_FuncsNoVerify.Add(0x1A, GetChallenge);
-			m_Funcs.Add(        0x1B, Status);
-			m_Funcs.Add(        0x1C, WorldBroadcast);
-			m_Funcs.Add(        0x1D, ChannelSend);
-			m_Actions.Add(      0x1E, Save);
-			m_Actions.Add(      0x1F, Shutdown);
-			m_FuncsNoVerify.Add(0x20, KeepAlive);
-			m_Funcs.Add(        0x22, KickBanUser);
-			m_Funcs.Add(        0x23, UnbanUser);
-			m_Funcs.Add(        0x24, GetOnlineUsers);
+			Register(0x1A, false, GetChallenge);
+			Register(0x1B, true, Status);
+			Register(0x1C, true, WorldBroadcast);
+			Register(0x1D, true, ChannelSend);
+			Register(0x1E, Save);
+			Register(0x1F, Shutdown);
+			Register(0x20, false, KeepAlive);
+			Register(0x22, true, KickBanUser);
+			Register(0x23, true, UnbanUser);
+			Register(0x24, true, GetOnlineUsers);
+			Register(0x25, true, AddLogPacketTarget);
+			Register(0x26, true, RemoveLogPacketTarget);
 
-			if (rconConfig.RelayEnabled())
+			if (rconConfig.IsLogTypeEnabled(LogEvent.Speech))
+				EventSink.Speech += EventSink_Speech;
+			if (rconConfig.IsLogTypeEnabled(LogEvent.AccountLogin))
+				EventSink.AccountLogin += EventSink_AccountLogin;
+			if (rconConfig.IsLogTypeEnabled(LogEvent.GameLogin))
+				EventSink.GameLogin += EventSink_GameLogin;
+			if (rconConfig.IsLogTypeEnabled(LogEvent.Connected))
+				EventSink.Connected += EventSink_Connected;
+			if (rconConfig.IsLogTypeEnabled(LogEvent.Disconnected))
+				EventSink.Disconnected += EventSink_Disconnected;
+			if (rconConfig.IsLogTypeEnabled(LogEvent.Login))
+				EventSink.Login += EventSink_Login;
+			if (rconConfig.IsLogTypeEnabled(LogEvent.CharacterCreated))
+				EventSink.CharacterCreated += EventSink_CharacterCreated;
+			if (rconConfig.IsLogTypeEnabled(LogEvent.Logout))
+				EventSink.Logout += EventSink_Logout;
+			if (rconConfig.IsLogTypeEnabled(LogEvent.ClientTypeReceived))
+				EventSink.ClientTypeReceived += EventSink_ClientTypeReceived;
+			if (rconConfig.IsLogTypeEnabled(LogEvent.ClientVersionReceived))
+				EventSink.ClientVersionReceived += EventSink_ClientVersionReceived;
+			if (rconConfig.IsLogTypeEnabled(LogEvent.Crashed))
+				EventSink.Crashed += EventSink_Crashed;
+			if (rconConfig.IsLogTypeEnabled(LogEvent.CreateGuild))
+				EventSink.CreateGuild += EventSink_CreateGuild;
+			if (rconConfig.IsLogTypeEnabled(LogEvent.DeleteRequest))
+				EventSink.DeleteRequest += EventSink_DeleteRequest;
+			if (rconConfig.IsLogTypeEnabled(LogEvent.HelpRequest))
+				EventSink.HelpRequest += EventSink_HelpRequest;
+			if (rconConfig.IsLogTypeEnabled(LogEvent.JoinGuild))
+				EventSink.JoinGuild += EventSink_JoinGuild;
+			if (rconConfig.IsLogTypeEnabled(LogEvent.OnEnterRegion))
+				EventSink.OnEnterRegion += EventSink_OnEnterRegion;
+			if (rconConfig.IsLogTypeEnabled(LogEvent.OnKilledBy))
+				EventSink.OnKilledBy += EventSink_OnKilledBy;
+			if (rconConfig.IsLogTypeEnabled(LogEvent.PlayerDeath))
+				EventSink.PlayerDeath += EventSink_PlayerDeath;
+			if (rconConfig.IsLogTypeEnabled(LogEvent.PlayerMurdered))
+				EventSink.PlayerMurdered += EventSink_PlayerMurdered;
+			if (rconConfig.IsLogTypeEnabled(LogEvent.QuestComplete))
+				EventSink.QuestComplete += EventSink_QuestComplete;
+			if (rconConfig.IsLogTypeEnabled(LogEvent.RenameRequest))
+				EventSink.RenameRequest += EventSink_RenameRequest;
+			if (rconConfig.IsLogTypeEnabled(LogEvent.Shutdown))
+				EventSink.Shutdown += EventSink_Shutdown;
+
+			if (rconConfig.EnableRelay)
 			{
 				if (rconConfig.ChatChannel != "*")
 				{
 					Channel.AddStaticChannel(rconConfig.ChatChannel);
 					if (rconConfig.AutoJoinChatChannel)
 					{
-						EventSink.Login += EventSink_Login;
+						EventSink.Login += EventSink_JoinDefaultChannelAtLogin;
 
 						// quietly ignore General channel join attempt on player login for 5 seconds
 						// ClassicUO client sends a join request when entering the game, but we want players in our channel
 						ChatActionHandlers.Register(0x62, false, new OnChatAction(BlockGeneralAtLogin));
 					}
 				}
-				ChatActionHandlers.Register(0x61, true, new OnChatAction(RelayChatPacket));
+				if(!IsMattebridgeEnabled())
+					ChatActionHandlers.Register(0x61, true, new OnChatAction(RelayChatPacket));
 			}
 
 			if (rconConfig.AllowAccountLink)
 			{
 				CommandHandlers.Register("VerifyExternal", AccessLevel.Player, SendVerifyPacket_OnCommand);
-				m_Funcs.Add(0x21, VerifyExternal);
+				Register(0x21, true, VerifyExternal);
 			}
 
-			if (rconConfig.WorldChatLog)
-				EventSink.Speech += EventSink_Speech;
+			EventSink.Shutdown += EventSink_StopListening; // shutdown initiated
 
-			UDPListener();
+			if(rconConfig.EnableRcon)
+			{
+				UDPListener();
+			}
+		}
+
+		public static void Register(byte command, bool verifyAuth, Func<IPEndPoint, PacketReader, byte[]> function)
+		{
+			if (verifyAuth)
+				m_Funcs.Add(command, function);
+			else
+				m_FuncsNoVerify.Add(command, function);
+		}
+
+		public static void Register(byte command, Action<IPEndPoint, PacketReader> function)
+		{
+			m_Actions.Add(command, function);
+		}
+
+		public static void SendLog(byte[] message)
+		{
+			foreach (var target in rconConfig.LogTargets)
+			{
+				udpListener.Send(message, message.Length, target);
+			}
+		}
+
+		private static void EventSink_AccountLogin(AccountLoginEventArgs e)
+		{
+			if(e.State != null && e.Accepted)
+			{
+				SendLog(FormatLog("AccountLoginSuccess", Accounting.Accounts.GetAccount(e.Username) as Accounting.Account, e.State));
+			}
+			else
+			{
+				SendLog(FormatLog("AccountLoginFail", Accounting.Accounts.GetAccount(e.Username) as Accounting.Account, e.State, e.RejectReason.ToString()));
+			}
 		}
 
 		private static void EventSink_Connected(ConnectedEventArgs e)
 		{
-			// to send log when user connects
+			SendLog(FormatLog("Connected", e.Mobile));
+		}
+
+		private static void EventSink_GameLogin(GameLoginEventArgs e)
+		{
+			SendLog(FormatLog("GameLogin", Accounting.Accounts.GetAccount(e.Username) as Accounting.Account, e.State));
 		}
 
 		private static void EventSink_Login(LoginEventArgs e)
 		{
-			var from = e.Mobile;
-			var defaultChannel = Channel.FindChannelByName(rconConfig.ChatChannel);
-			var chatUser = ChatUser.AddChatUser(from);
-			defaultChannel.AddUser(chatUser);
+			SendLog(FormatLog("Login", e.Mobile));
+		}
+
+		private static void EventSink_Logout(LogoutEventArgs e)
+		{
+			SendLog(FormatLog("Logout", e.Mobile));
 		}
 
 		private static void EventSink_Disconnected(DisconnectedEventArgs e)
 		{
-			// to send log when user disconnects
+			SendLog(FormatLog("Disconnected", e.Mobile));
+		}
+
+		private static void EventSink_CharacterCreated(CharacterCreatedEventArgs e)
+		{
+			SendLog(FormatLog("CharacterCreated", e.Mobile, e.State));
+		}
+
+		private static void EventSink_ClientTypeReceived(ClientTypeReceivedArgs e)
+		{
+			SendLog(FormatLog("ClientTypeReceived", e.State));
+		}
+
+		private static void EventSink_ClientVersionReceived(ClientVersionReceivedArgs e)
+		{
+			if (e.State != null)
+			{
+				SendLog(FormatLog("ClientVersionReceived", e.State, e.State.Version.ToString()));
+			}
+		}
+
+		private static void EventSink_Crashed(CrashedEventArgs e)
+		{
+			if (e.Exception != null)
+			{
+				SendLog(FormatLog("Crashed", e.Exception.Message));
+			}
+		}
+
+		private static void EventSink_CreateGuild(CreateGuildEventArgs e)
+		{
+			if (e.Guild != null)
+			{
+				SendLog(FormatLog("CreateGuild", e.Guild.Name));
+			}
+		}
+
+		private static void EventSink_JoinGuild(JoinGuildEventArgs e)
+		{
+			if (e.Guild != null)
+			{
+				SendLog(FormatLog("JoinGuild", e.Mobile, e.Guild.Name));
+			}
+		}
+
+		private static void EventSink_DeleteRequest(DeleteRequestEventArgs e)
+		{
+			SendLog(FormatLog("DeleteRequest", e.State, e.Index.ToString()));
+		}
+
+		private static void EventSink_HelpRequest(HelpRequestEventArgs e)
+		{
+			SendLog(FormatLog("HelpRequest", e.Mobile));
+		}
+
+		private static void EventSink_OnEnterRegion(OnEnterRegionEventArgs e)
+		{
+			if (e.From != null && e.From is Mobiles.PlayerMobile)
+			{
+				if (e.OldRegion != null)
+					SendLog(FormatLog("OnEnterRegion", e.From, e.OldRegion.Name));
+			}
+		}
+
+		private static void EventSink_OnKilledBy(OnKilledByEventArgs e)
+		{
+			if(e.Killed is Mobiles.PlayerMobile)
+			{
+				SendLog(FormatLog("OnKilledBy", e.Killed, e.KilledBy));
+			}
+		}
+
+		private static void EventSink_PlayerDeath(PlayerDeathEventArgs e)
+		{
+			SendLog(FormatLog("PlayerDeath", e.Mobile, e.Killer));
+		}
+
+		private static void EventSink_PlayerMurdered(PlayerMurderedEventArgs e)
+		{
+			SendLog(FormatLog("PlayerMurdered", e.Murderer, e.Victim));
+		}
+
+		private static void EventSink_QuestComplete(QuestCompleteEventArgs e)
+		{
+			if (e.QuestType != null)
+			{
+				SendLog(FormatLog("QuestComplete", e.Mobile, e.QuestType.FullName));
+			}
+		}
+
+		private static void EventSink_RenameRequest(RenameRequestEventArgs e)
+		{
+			SendLog(FormatLog("RenameRequest", e.From, e.Target, e.Name));
+		}
+
+		private static void EventSink_Shutdown(ShutdownEventArgs e)
+		{
+			SendLog(FormatLog("Shutdown"));
+		}
+
+		private static void EventSink_StopListening(ShutdownEventArgs e)
+		{
+			m_StopListening = true;
 		}
 
 		private static void EventSink_Speech(SpeechEventArgs e)
 		{
-			Mobile from = e.Mobile;
-			if (from is Mobiles.PlayerMobile)
+			if (e.Mobile is Mobiles.PlayerMobile)
 			{
-				byte[] data = Encoding.ASCII.GetBytes("UO\tmw\t" + from.Name + "\t" + from.X + " " + from.Y + " " + from.Z + "\t" + e.Speech);
-				udpListener.Send(data, data.Length, rconConfig.ChatPacketTargetAddress, rconConfig.ChatPacketTargetPort);
+				SendLog(FormatLog("Speech", e.Mobile, e.Speech));
 			}
+		}
+
+		private static void EventSink_JoinDefaultChannelAtLogin(LoginEventArgs e)
+		{
+			var defaultChannel = Channel.FindChannelByName(rconConfig.ChatChannel);
+			var chatUser = ChatUser.AddChatUser(e.Mobile);
+			defaultChannel.AddUser(chatUser);
 		}
 
 		[Usage("VerifyExternal")]
@@ -266,8 +528,7 @@ namespace Server.RemoteAdmin
 				return;
 			}
 
-			byte[] data = Encoding.ASCII.GetBytes("UO\tv\t" + from.Account.Username + "\t" + confirmation);
-			udpListener.Send(data, data.Length, rconConfig.ChatPacketTargetAddress, rconConfig.ChatPacketTargetPort);
+			SendLog(FormatLog("Verify", from, confirmation.ToString()));
 			m_AccountLinkChallenges.Remove(from.Account.Username);
 		}
 
@@ -279,12 +540,14 @@ namespace Server.RemoteAdmin
 				Console.WriteLine("RCON: Listening on *.*.*.*:{0}", rconConfig.ListenPort);
 				Utility.PopColor();
 
-				while (true)
+				while (!m_StopListening)
 				{
 					var receivedResults = await udpListener.ReceiveAsync();
 
 					ProcessPacket(receivedResults, udpListener);
 				}
+				await Task.Delay(500); // to ensure shutdown log is sent before closing socket
+				udpListener.Close();
 			});
 		}
 
@@ -406,13 +669,12 @@ namespace Server.RemoteAdmin
 
 			ChatActionHandlers.JoinChannel(from, channel, param);
 		}
-		private static void RelayChatPacket(ChatUser from, Channel channel, string param)
+		public static void RelayChatPacket(ChatUser from, Channel channel, string param)
 		{
 			ChatActionHandlers.ChannelMessage(from, channel, param);
 			if (channel.Name == rconConfig.ChatChannel || rconConfig.ChatChannel == "*")
 			{
-				byte[] data = Encoding.ASCII.GetBytes("UO\tm\t" + channel.Name + "\t" + from.Username + "\t" + param);
-				udpListener.Send(data, data.Length, rconConfig.ChatPacketTargetAddress, rconConfig.ChatPacketTargetPort);
+				SendLog(FormatLog("Chat." + channel.Name, from.Mobile, param));
 			}
 		}
 
@@ -434,7 +696,7 @@ namespace Server.RemoteAdmin
 				m_Challenges.Add(remote.Address.ToString(), new RconChallengeRecord(remote, challengeBytes));
 			}
 
-			byte[] header = BitConverter.GetBytes((int)-1).Reverse().ToArray();
+			byte[] header = BitConverter.GetBytes((int)-1);
 
 			byte[] challenge = { 0xFF, 0xFF, 0xFF, 0xFF, 0x0A, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0x32, 0x0A };
 			challengeBytes.CopyTo(challenge, 6);
@@ -641,13 +903,26 @@ namespace Server.RemoteAdmin
 			}
 		}
 
+		// Known issue: If there are two users with the same name, this behavior is unpredictable.
+		// It may be worth it to revisit later for larger shards without unique names.
 		private static byte[] UnbanUser(IPEndPoint remote, PacketReader pvSrc)
 		{
 			string name = pvSrc.ReadString();
 			var acc = Accounting.Accounts.GetAccount(name);
 
 			if (acc == null)
-				return RconResponsePackets.Fail;
+			{
+				foreach (var mob in Mobiles.PlayerMobile.Instances)
+				{
+					if (mob.Name == name)
+					{
+						acc = mob.Account;
+						break;
+					}
+				}
+				if (acc == null)
+					return RconResponsePackets.Fail;
+			}
 
 			acc.Banned = false;
 			CommandLogging.WriteLine(null, "RCON unbanning {0}", CommandLogging.Format(acc));
@@ -683,6 +958,162 @@ namespace Server.RemoteAdmin
 
 			return_packet = return_packet.Append((byte)0x0A).ToArray();
 			return return_packet;
+		}
+
+		private static byte[] AddLogPacketTarget(IPEndPoint remote, PacketReader pvSrc)
+		{
+			string addr = pvSrc.ReadString();
+			int port = pvSrc.ReadInt32();
+
+			try
+			{
+				rconConfig.AddLogTarget(addr, port);
+			}
+			catch
+			{
+				return RconResponsePackets.Fail;
+			}
+			
+			return RconResponsePackets.Success;
+		}
+
+		private static byte[] RemoveLogPacketTarget(IPEndPoint remote, PacketReader pvSrc)
+		{
+			string addr = pvSrc.ReadString();
+			int port = pvSrc.ReadInt32();
+
+			try
+			{
+				rconConfig.RemoveLogTarget(addr, port);
+			}
+			catch
+			{
+				return RconResponsePackets.Fail;
+			}
+
+			return RconResponsePackets.Success;
+		}
+
+		private static byte[] FormatLog(string logType)
+		{
+			return FormatLog(logType, null, null, null, null, null);
+		}
+
+		private static byte[] FormatLog(string logType, string message)
+		{
+			return FormatLog(logType, null, null, null, null, message);
+		}
+
+		private static byte[] FormatLog(string logType, NetState state)
+		{
+			return FormatLog(logType, state.Account as Accounting.Account, state.Mobile as Mobiles.PlayerMobile, state, null, null);
+		}
+
+		private static byte[] FormatLog(string logType, NetState state, string message)
+		{
+			return FormatLog(logType, state.Account as Accounting.Account, state.Mobile as Mobiles.PlayerMobile, state, null, message);
+		}
+
+		private static byte[] FormatLog(string logType, Accounting.Account acc)
+		{
+			return FormatLog(logType, acc, null, null, null, null);
+		}
+
+		private static byte[] FormatLog(string logType, Accounting.Account acc, string message)
+		{
+			return FormatLog(logType, acc, null, null, null, message);
+		}
+
+		private static byte[] FormatLog(string logType, Accounting.Account acc, NetState state)
+		{
+			return FormatLog(logType, acc, null, state, null, null);
+		}
+
+		private static byte[] FormatLog(string logType, Accounting.Account acc, NetState state, string message)
+		{
+			return FormatLog(logType, acc, null, state, null, message);
+		}
+
+		private static byte[] FormatLog(string logType, Mobile from)
+		{
+			return FormatLog(logType, (Accounting.Account) from.Account, from, from.NetState, null, null);
+		}
+
+		private static byte[] FormatLog(string logType, Mobile from, string message)
+		{
+			return FormatLog(logType, (Accounting.Account)from.Account, from, from.NetState, null, message);
+		}
+
+		private static byte[] FormatLog(string logType, Mobile from, NetState state)
+		{
+			return FormatLog(logType, (Accounting.Account)from.Account, from, state, null, null);
+		}
+
+		private static byte[] FormatLog(string logType, Mobile from, NetState state, string message)
+		{
+			return FormatLog(logType, (Accounting.Account)from.Account, from, state, null, message);
+		}
+
+		private static byte[] FormatLog(string logType, Mobile from, Mobile to)
+		{
+			return FormatLog(logType, (Accounting.Account)from.Account, from, from.NetState, to, null);
+		}
+
+		private static byte[] FormatLog(string logType, Mobile from, Mobile to, string message)
+		{
+			return FormatLog(logType, (Accounting.Account)from.Account, from, from.NetState, to, message);
+		}
+
+		private static byte[] FormatLog(string logType, Accounting.Account acc, Mobile from, NetState state, Mobile to, string message)
+		{
+			string e = "UO\t" + logType + "\t";
+			string addr = null;
+
+			if (state != null)
+				addr = state.Address.ToString();
+
+			if (acc != null)
+				e += acc.Username;
+			e += "\t";
+
+			if (from != null)
+			{
+				e += from.Serial.Value.ToString() + "\t" + from.Name + "\t";
+				if (from.NetState != null)
+				{
+					e += from.Region.Name + "\t" + from.X + "," + from.Y + "," + from.Z + "\t";
+
+					if (addr == null)
+						addr = from.NetState.Address.ToString();
+				}
+				else
+					e += "\t\t";
+			}
+			else
+				e += "\t\t\t\t";
+
+			if (addr != null)
+				e += addr;
+			e += "\t";
+
+			if (to != null)
+				e += to.Serial.ToString() + "\t" + to.Name + "\t";
+			else
+				e += "\t\t";
+
+			if (message != null)
+				e += message;
+			e += "\n";
+
+			return Encoding.ASCII.GetBytes(e);
+		}
+
+		private static bool IsMattebridgeEnabled()
+		{
+			var matterbridgeClass = Type.GetType("Server.Custom.Matterbridge");
+			if (matterbridgeClass != null)
+				return true;
+			return false;
 		}
 	}
 }
