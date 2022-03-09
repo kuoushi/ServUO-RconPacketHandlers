@@ -10,7 +10,7 @@ from aioudp import UDPServer
 
 
 class Config:
-    def __init__(self, cfg="UORconConfig.json"):
+    def __init__(self, cfg="myTempUOConfig.json"):
         self.filename = cfg
         with open(f'.\\{cfg}', 'rb') as file:
             self.cfgdata = json.load(file)
@@ -88,37 +88,28 @@ class UOMessage(BaseMessage):
 
         mstring = data.replace(b'\xff', b'').replace(b'\x00', b'').replace(b'\n', b'').decode("ascii")
         split = mstring.split("\t")
-        self.log_type = None
+        self.log_type = split[1]
+        self.log = data
 
         self.chat_message = False
-        if split[1] == "m":
+        if self.log_type.startswith("Chat."):
             self.chat_message = True
-            self.log_type = "chat message"
-            self.location += f" | {split[2]}"
+            self.location = self.log_type[5:]
+        else:
+            self.location = f"{split[5]} ({split[6]})"
 
-            author = split[3]
-            m = re.search("^<([0-9]+)>(.+)$", author)
-            if m:
-                self.author = m.group(2)
-                self.id = int(m.group(1))
-            else:
-                self.author = author
-                self.id = -1
-            self.message = split[4]
-        elif split[1] == "v":
-            self.chat_message = False
-            self.log_type = "verify"
-            self.author = split[2]
-            self.message = int(split[3])
-        elif split[1] == "mw":
-            self.chat_message = False
-            self.log_type = "world message"
-            self.author = split[2]
-            self.location += f" ({', '.join(split[3].split(' '))})"
-            self.message = split[4]
+        self.author = f"{split[2]} (<{split[3]}>{split[4]})"
+        self.account = split[2]
+
+        self.message = split[10]
 
     def relay_string(self, target_service=False):
-        return f'{self.service.upper()} | {self.author}: {self.message}'
+        if self.message:
+            return f'{self.service.upper()} | {self.author}: {self.message}'
+        return f'{self.service.upper()} | {self.author}: {self.log_type}'
+
+    def log_tostring(self):
+        return f"{self.log.decode('utf-8')}"
 
 
 class UO(discord_commands.Cog):
@@ -154,13 +145,16 @@ class UO(discord_commands.Cog):
 
         if data[0:2] == b'UO':
             message = UOMessage(data=data, location=source)
-            if message.chat_message or message.log_type == "world message":
-                print(message)
+            # print(message.relay_string())
+            print(message.log_tostring())
+            if message.chat_message or message.log_type == "Speech":
                 await self.discord_bot.on_service_message(message)
-            elif message.log_type == "verify":
-                if self.rcon_socket.verify_check(message.author, int(message.message)):
+            elif message.log_type == "Verify":
+                if self.rcon_socket.verify_check(message.account, int(message.message)):
                     relay_channel = self.discord_bot.get_channel(self.discord_bot.config.get_discord_home_channel())
-                    await relay_channel.send(f"The {message.author} account is now linked.")
+                    await relay_channel.send(f"The {message.account} account is now linked.")
+            else:
+                await self.discord_bot.on_service_message(message)
 
     async def keep_alive(self):
         while True:

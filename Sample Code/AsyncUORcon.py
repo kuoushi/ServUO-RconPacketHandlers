@@ -143,6 +143,12 @@ class AsyncUORcon:
     async def online_users(self, start_index=0, max_entries=20):
         return await self.rcon(b'\x24', start_index, max_entries)
 
+    async def add_log_target(self, ip: str, port: int):
+        return await self.rcon(b'\x25', ip, port)
+
+    async def remove_log_target(self, ip: str, port: int):
+        return await self.rcon(b'\x26', ip, port)
+
 
 async def main(loop):
     # for testing library directly
